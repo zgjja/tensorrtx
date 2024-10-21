@@ -1,24 +1,13 @@
-cmake_minimum_required(VERSION 3.14)  # change the version, if asked by compiler
-project(mlp)
+cmake_minimum_required(VERSION 3.17.0)
 
-set(CMAKE_CXX_STANDARD 14)
+project(
+  mlp
+  VERSION 0.1
+  LANGUAGES C CXX CUDA)
 
-# include and link dirs of tensorrt, you need adapt them if yours are different
-include_directories(/usr/include/x86_64-linux-gnu/)
-link_directories(/usr/lib/x86_64-linux-gnu/)
+add_executable(${PROJECT_NAME} mlp.cpp)
 
-# include and link dirs of cuda for inference
-include_directories(/usr/local/cuda/include)
-link_directories(/usr/local/cuda/lib64)
+target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
-# create link for executable files
-add_executable(mlp mlp.cpp)
-
-# perform linking with nvinfer libraries
-target_link_libraries(mlp nvinfer)
-
-# link with cuda libraries for Inference
-target_link_libraries(mlp cudart)
-
-add_definitions(-O2 -pthread)
-
+target_link_libraries(${PROJECT_NAME} PUBLIC Threads::Threads
+                                             TensorRT::TensorRT CUDA::cudart)

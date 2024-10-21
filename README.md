@@ -38,7 +38,7 @@ The basic workflow of TensorRTx is:
 - [A guide for quickly getting started, taking lenet5 as a demo.](./tutorials/getting_started.md)
 - [The .wts file content format](./tutorials/getting_started.md#the-wts-content-format)
 - [Frequently Asked Questions (FAQ)](./tutorials/faq.md)
-- [Migrating from TensorRT 4 to 7](./tutorials/migrating_from_tensorrt_4_to_7.md)
+- [Migration Guide](./tutorials/migration_guide.md)
 - [How to implement multi-GPU processing, taking YOLOv4 as example](./tutorials/multi_GPU_processing.md)
 - [Check if Your GPU support FP16/INT8](./tutorials/check_fp16_int8_support.md)
 - [How to Compile and Run on Windows](./tutorials/run_on_windows.md)
@@ -47,12 +47,44 @@ The basic workflow of TensorRTx is:
 
 ## Test Environment
 
-1. TensorRT 7.x
-2. TensorRT 8.x(Some of the models support 8.x)
+1. (**NOT recommended**) TensorRT 7.x
+2. (**Recommended**)TensorRT 8.x
+3. (**NOT recommended**) TensorRT 10.x
+
+### Note
+
+1. For history reason, some of the models are limited to specific TensorRT version, please check the README.md or code for the model you want to use.
+2. Currently, TensorRT 8.x has better compatibility and the most of the features  supported.
 
 ## How to run
 
-Each folder has a readme inside, which explains how to run the models inside.
+**Note**: many of the network maybe not included in the "top" cmake project, because they are under refactoring, so please enter its subfolder to build.
+
+Each model is a subproject, you can build them with cmake like:
+```BASH
+# 1. generate xxx.wts from https://github.com/wang-xinyu/pytorchx/tree/master/lenet
+# ...
+
+# 2. put xxx.wts on top of this folder
+# ...
+
+# 3.1 (Option) Uncomment the model you don't want to build or not suppoted by your TensorRT version in CMakeLists.txt
+# ...
+# 3.2 configure project with cmake and build with Ninja
+cd tensorrtx
+cmake -S . -B build -G Ninja
+ninja -C build
+
+# 4.1 Serialize model to plan file i.e. 'xxx.engine'
+build/lenet -s
+# 4.2 deserialize plan file and run inference
+build/lenet -d
+
+# 5. (Optional) See if the output is same as pytorchx/lenet
+# ...
+```
+
+For more details, each subfolder may contain a README.md inside, which explains more.
 
 ## Models
 

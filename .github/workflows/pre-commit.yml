@@ -5,16 +5,46 @@ on:
     branches:
       - master
       - trt10
+  push:
+    branches:
+      - master
 
 jobs:
   pre-commit:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+
     steps:
-    - uses: actions/checkout@v3
-      with:
-        # grab the history of the PR
-        fetch-depth: 0
-    - uses: actions/setup-python@v3
-    - uses: pre-commit/action@v3.0.1
-      with:
-        extra_args: --from-ref ${{ github.event.pull_request.base.sha }} --to-ref ${{ github.event.pull_request.head.sha }}
+      - uses: actions/checkout@v5
+        with:
+          # grab the history of the PR
+          fetch-depth: 0
+      - uses: actions/setup-python@v3
+      - uses: pre-commit/action@v3.0.1
+        with:
+          extra_args: --from-ref ${{ github.event.pull_request.base.sha }} --to-ref ${{ github.event.pull_request.head.sha }}
+
+  cxx-lint:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    container:
+      image: nvcr.io/nvidia/tensorrt:25.12-py3
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          apt update && apt install -y clangd clang-tidy clang-format libopencv-dev ninja-build
+
+      - name: Configure
+        run:
+          cmake -S . -B build -G Ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: run-clang-tidy
+        run: BUILD_DIR=build make run-clang-tidy
+
+      - name: run-clang-format
+        run: make run-clang-format

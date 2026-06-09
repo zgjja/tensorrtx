@@ -1,11 +1,23 @@
 #include <NvInfer.h>
 #include <cuda_fp16.h>
+#include <algorithm>
+#include <array>
 #include <cassert>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
-#include <unordered_map>
+#include <limits>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
 #include "cuda_allocator.h"
 #include "logging.h"
 #include "macros.h"
@@ -18,12 +30,12 @@ using M = nvinfer1::MatrixOperation;
 using E = nvinfer1::ElementWiseOperation;
 using NDCF = nvinfer1::NetworkDefinitionCreationFlag;
 
-//      DataType::kHALF  -> FP16
-//      DataType::kFLOAT -> FP32
+// DataType::kHALF  -> FP16
+// DataType::kFLOAT -> FP32
 static constexpr DataType BUILD_PRECISION = DataType::kHALF;
 static constexpr int64_t BUILD_MIN_BATCH = 1;
-static constexpr int64_t BUILD_OPT_BATCH = 2;
-static constexpr int64_t BUILD_MAX_BATCH = 4;
+static constexpr int64_t BUILD_OPT_BATCH = 1;
+static constexpr int64_t BUILD_MAX_BATCH = 2;
 
 // ViT model variant table.
 // All variants share the same architecture; only sizes differ.
@@ -37,9 +49,7 @@ struct ViTConfig {
     int64_t num_classes = 1000;
     int64_t patch = 16;
     int64_t img_size = 224;
-    // Dynamic-batch profile: min / opt / max for the optimization profile.
-    // Defaults come from the build-time BUILD_*_BATCH constants above; the
-    // `-d` runtime path overwrites these from the engine's profile.
+    // Optimization profile used by the generated engine.
     int64_t min_batch = BUILD_MIN_BATCH;
     int64_t opt_batch = BUILD_OPT_BATCH;
     int64_t max_batch = BUILD_MAX_BATCH;
@@ -47,18 +57,20 @@ struct ViTConfig {
     std::string model_type = "ViT-B/16";
     std::string wts_path;
     std::string engine_path;
-    int64_t num_patches() const { return (img_size / patch) * (img_size / patch); }
-    int64_t seq_len() const { return num_patches() + 1; }
+    [[nodiscard]] int64_t num_patches() const { return (img_size / patch) * (img_size / patch); }
+    [[nodiscard]] int64_t seq_len() const { return num_patches() + 1; }
 };
 
 static std::string normalizeModelType(const std::string& s) {
     // Accept "ViT-B/16", "vit-b/16", "b16", "B/16" -> "ViT-B/16".
     std::string t;
-    for (char c : s)
-        if (c != '-' && c != '/' && c != ' ')
-            t += std::toupper(c);
+    for (char c : s) {
+        if (c != '-' && c != '/' && c != ' ') {
+            t += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+    }
     // Strip leading "VIT"
-    if (t.rfind("VIT", 0) == 0)
+    if (t.starts_with("VIT"))
         t = t.substr(3);
     if (t == "B16")
         return "ViT-B/16";
@@ -129,7 +141,7 @@ static ViTConfig getVariantConfig(const std::string& raw_name) {
 static constexpr const std::array<const char*, 2> NAMES = {"input", "logits"};
 static constexpr const std::array<const float, 3> mean = {0.5f, 0.5f, 0.5f};
 static constexpr const std::array<const float, 3> stdv = {0.5f, 0.5f, 0.5f};
-static constexpr const char* LABELS_PATH = "../assets/imagenet1000_clsidx_to_labels.txt";
+static constexpr const char* LABELS_PATH = "assets/imagenet1000_clsidx_to_labels.txt";
 
 static Logger gLogger;
 
@@ -139,6 +151,8 @@ static auto bytesPerElement(DataType t) -> std::size_t {
             return 4;
         case DataType::kHALF:
             return 2;
+        case DataType::kINT64:
+            return 8;
         case DataType::kINT32:
             return 4;
 #if TRT_VERSION >= 8000
@@ -183,6 +197,82 @@ struct ViTParam {
     int64_t ff_dim;
     float lnorm_eps = 1e-12f;
 };
+
+struct RepeatedWeightsStorage {
+    std::vector<std::vector<uint32_t>> f32;
+    std::vector<std::vector<half>> f16;
+    std::vector<std::vector<int64_t>> i64;
+};
+
+static auto makeRepeatedBatchWeights(const Weights& src, int64_t repeat, RepeatedWeightsStorage& storage) -> Weights {
+    if (repeat <= 0 || src.values == nullptr || src.count <= 0) {
+        std::cerr << "invalid repeated weight\n";
+        std::abort();
+    }
+
+    if (src.type == DataType::kHALF) {
+        const auto* values = reinterpret_cast<const half*>(src.values);
+        storage.f16.emplace_back(static_cast<std::size_t>(src.count * repeat));
+        auto& dst = storage.f16.back();
+        for (int64_t i = 0; i < repeat; ++i) {
+            std::copy(values, values + src.count, dst.begin() + i * src.count);
+        }
+        return Weights{src.type, dst.data(), static_cast<int64_t>(dst.size())};
+    }
+
+    if (src.type == DataType::kFLOAT) {
+        const auto* values = reinterpret_cast<const uint32_t*>(src.values);
+        storage.f32.emplace_back(static_cast<std::size_t>(src.count * repeat));
+        auto& dst = storage.f32.back();
+        for (int64_t i = 0; i < repeat; ++i) {
+            std::copy(values, values + src.count, dst.begin() + i * src.count);
+        }
+        return Weights{src.type, dst.data(), static_cast<int64_t>(dst.size())};
+    }
+
+    std::cerr << "unsupported repeated weight dtype\n";
+    std::abort();
+}
+
+static auto addShapeConstant(INetworkDefinition* net, std::initializer_list<int64_t> values,
+                             RepeatedWeightsStorage& storage) -> ITensor* {
+    storage.i64.emplace_back(values);
+    auto& data = storage.i64.back();
+    Dims dims{};
+    dims.nbDims = 1;
+    dims.d[0] = static_cast<int64_t>(data.size());
+    auto* c = net->addConstant(dims, Weights{DataType::kINT64, data.data(), static_cast<int64_t>(data.size())});
+    return c->getOutput(0);
+}
+
+static auto addBatchedConstantSlice(INetworkDefinition* net, ITensor& input, ITensor& full, int64_t dim1, int64_t dim2,
+                                    RepeatedWeightsStorage& storage) -> ITensor* {
+    auto* input_shape = net->addShape(input);
+    Dims batch_start{};
+    batch_start.nbDims = 1;
+    batch_start.d[0] = 0;
+    Dims batch_size{};
+    batch_size.nbDims = 1;
+    batch_size.d[0] = 1;
+    Dims batch_stride{};
+    batch_stride.nbDims = 1;
+    batch_stride.d[0] = 1;
+    auto* batch = net->addSlice(*input_shape->getOutput(0), batch_start, batch_size, batch_stride);
+    auto* size_tail = addShapeConstant(net, {dim1, dim2}, storage);
+    const std::array<ITensor*, 2> size_inputs = {batch->getOutput(0), size_tail};
+    auto* size = net->addConcatenation(size_inputs.data(), static_cast<int32_t>(size_inputs.size()));
+    size->setAxis(0);
+
+    auto* start = addShapeConstant(net, {0, 0, 0}, storage);
+    auto* stride = addShapeConstant(net, {1, 1, 1}, storage);
+    const auto full_dims = full.getDimensions();
+    auto* slice =
+            net->addSlice(full, Dims3{0, 0, 0}, Dims3{full_dims.d[0], full_dims.d[1], full_dims.d[2]}, Dims3{1, 1, 1});
+    slice->setInput(1, *start);
+    slice->setInput(2, *size->getOutput(0));
+    slice->setInput(3, *stride);
+    return slice->getOutput(0);
+}
 
 static auto addGeLU(INetworkDefinition* net, ITensor& input) -> ILayer* {
 #if TRT_VERSION < 10000
@@ -298,8 +388,10 @@ auto ViTLayer(INetworkDefinition* net, WeightMap& w, ITensor& input, const ViTPa
     auto* q_scaled = net->addElementWise(*q_s->getOutput(0), *qk_scale_w->getOutput(0), E::kPROD)->getOutput(0);
     auto* attn = net->addAttention(*q_scaled, *k_s->getOutput(0), *v_s->getOutput(0), ANO::kSOFTMAX, false);
     assert(attn != nullptr);
-    auto status = attn->setDecomposable(false);
-    assert(status);
+    if (!attn->setDecomposable(false)) {
+        std::cerr << "setDecomposable failed\n";
+        std::abort();
+    }
     auto* attn_out = net->addShuffle(*attn->getOutput(0));
 #else
     auto* qk = net->addMatrixMultiply(*q_s->getOutput(0), M::kNONE, *k_s->getOutput(0), M::kTRANSPOSE);
@@ -364,15 +456,7 @@ auto createEngine(const ViTConfig& cfg, IRuntime* runtime, IBuilder* builder, IB
         convertWeightMapToHalf(w);
     }
 
-    const int64_t H = cfg.hidden;
-    const int64_t P = cfg.patch;
-    const int64_t IMG = cfg.img_size;
-    const int64_t NP = cfg.num_patches();
-    const int64_t SEQ = cfg.seq_len();
-    const int64_t NC = cfg.num_classes;
-    const int64_t MIB = cfg.min_batch;
-    const int64_t OPB = cfg.opt_batch;
-    const int64_t MAB = cfg.max_batch;
+    RepeatedWeightsStorage repeated_storage;
 
 #if TRT_VERSION >= 10000
     auto* net = builder->createNetworkV2(1U << static_cast<uint32_t>(NDCF::kSTRONGLY_TYPED));
@@ -381,87 +465,48 @@ auto createEngine(const ViTConfig& cfg, IRuntime* runtime, IBuilder* builder, IB
 #endif
 
     // 1. patch embedding
-    Dims input_dims;
-    input_dims.nbDims = 4;
-    input_dims.d[0] = -1;
-    input_dims.d[1] = 3;
-    input_dims.d[2] = IMG;
-    input_dims.d[3] = IMG;
+    Dims input_dims{.nbDims = 4, .d = {-1, 3, cfg.img_size, cfg.img_size}};
     ITensor* data = net->addInput(NAMES[0], dt, input_dims);
     std::string name = "vit.embeddings.patch_embeddings.projection.";
-    auto* embed = net->addConvolutionNd(*data, H, DimsHW{P, P}, w[name + "weight"], w[name + "bias"]);
+    auto* embed = net->addConvolutionNd(*data, cfg.hidden, DimsHW{cfg.patch, cfg.patch}, w[name + "weight"],
+                                        w[name + "bias"]);
     embed->setName("patch embedding");
-    embed->setStrideNd(DimsHW{P, P});
+    embed->setStrideNd(DimsHW{cfg.patch, cfg.patch});
     auto* s = net->addShuffle(*embed->getOutput(0));
-    s->setReshapeDimensions(Dims3{0, H, NP});
+    s->setReshapeDimensions(Dims3{0, cfg.hidden, cfg.num_patches()});
     s->setSecondTranspose({0, 2, 1});
 
     // 2. add cls token and position embedding
-    auto* cls_token = net->addConstant(Dims3{1, 1, H}, w["vit.embeddings.cls_token"]);
-    auto* pos_embed = net->addConstant(Dims3{1, SEQ, H}, w["vit.embeddings.position_embeddings"]);
-    // Broadcast cls_token to dynamic batch [B,1,H] using Slice with stride=0 on batch dim.
-    auto* shape_data = net->addShape(*data)->getOutput(0);  // shape tensor [4]
-    Dims one_d;
-    one_d.nbDims = 1;
-    one_d.d[0] = 1;
-    Dims sl_start;
-    sl_start.nbDims = 1;
-    sl_start.d[0] = 0;
-    Dims sl_size;
-    sl_size.nbDims = 1;
-    sl_size.d[0] = 1;
-    Dims sl_stride;
-    sl_stride.nbDims = 1;
-    sl_stride.d[0] = 1;
-    auto* batch_dim = net->addSlice(*shape_data, sl_start, sl_size, sl_stride)->getOutput(0);
-    static const int64_t one_h_data[2] = {1, static_cast<int64_t>(H)};
-    Weights one_h_w{DataType::kINT64, one_h_data, 2};
-    Dims two_d;
-    two_d.nbDims = 1;
-    two_d.d[0] = 2;
-    auto* one_h_const = net->addConstant(two_d, one_h_w)->getOutput(0);
-    const std::array<ITensor*, 2> shp_in = {batch_dim, one_h_const};
-    auto* tgt_shape = net->addConcatenation(shp_in.data(), 2);
-    tgt_shape->setAxis(0);
-    Dims start3;
-    start3.nbDims = 3;
-    start3.d[0] = 0;
-    start3.d[1] = 0;
-    start3.d[2] = 0;
-    Dims stride3;
-    stride3.nbDims = 3;
-    stride3.d[0] = 0;
-    stride3.d[1] = 1;
-    stride3.d[2] = 1;
-    Dims dummy3;
-    dummy3.nbDims = 3;
-    dummy3.d[0] = 1;
-    dummy3.d[1] = 1;
-    dummy3.d[2] = H;
-    auto* cls_slice = net->addSlice(*cls_token->getOutput(0), start3, dummy3, stride3);
-    cls_slice->setInput(2, *tgt_shape->getOutput(0));
-    const std::array<ITensor*, 2> _cat = {cls_slice->getOutput(0), s->getOutput(0)};
+    auto cls_weights = makeRepeatedBatchWeights(w["vit.embeddings.cls_token"], cfg.max_batch, repeated_storage);
+    auto pos_weights =
+            makeRepeatedBatchWeights(w["vit.embeddings.position_embeddings"], cfg.max_batch, repeated_storage);
+    auto* cls_full = net->addConstant(Dims3{cfg.max_batch, 1, cfg.hidden}, cls_weights);
+    auto* pos_full = net->addConstant(Dims3{cfg.max_batch, cfg.seq_len(), cfg.hidden}, pos_weights);
+    auto* cls_token = addBatchedConstantSlice(net, *data, *cls_full->getOutput(0), 1, cfg.hidden, repeated_storage);
+    auto* pos_embed =
+            addBatchedConstantSlice(net, *data, *pos_full->getOutput(0), cfg.seq_len(), cfg.hidden, repeated_storage);
+    const std::array<ITensor*, 2> _cat = {cls_token, s->getOutput(0)};
     auto* cat = net->addConcatenation(_cat.data(), 2);
     cat->setAxis(1);
     cat->setName("cat_clstoken_embed");
-    auto* pos_added = net->addElementWise(*cat->getOutput(0), *pos_embed->getOutput(0), ElementWiseOperation::kSUM);
+    auto* pos_added = net->addElementWise(*cat->getOutput(0), *pos_embed, ElementWiseOperation::kSUM);
     pos_added->setName("position_embed");
 
     // 3. transformer encoder layers
     ITensor* input = pos_added->getOutput(0);
-    for (auto i = 0u; i < cfg.num_layers; i++) {
+    for (int64_t i = 0; i < cfg.num_layers; i++) {
         auto* vit = ViTLayer(net, w, *input,
-                             {.index = i,
+                             {.index = static_cast<uint32_t>(i),
                               .head_num = static_cast<uint32_t>(cfg.num_heads),
-                              .hidden = H,
+                              .hidden = cfg.hidden,
                               .ff_dim = cfg.ff_dim,
                               .lnorm_eps = cfg.lnorm_eps});
         input = vit;
     }
 
     // 4. layer norm after transformer encoder
-    auto* ln_scale = net->addConstant(Dims3{1, 1, H}, w["vit.layernorm.weight"]);
-    auto* ln_bias = net->addConstant(Dims3{1, 1, H}, w["vit.layernorm.bias"]);
+    auto* ln_scale = net->addConstant(Dims3{1, 1, cfg.hidden}, w["vit.layernorm.weight"]);
+    auto* ln_bias = net->addConstant(Dims3{1, 1, cfg.hidden}, w["vit.layernorm.bias"]);
     uint32_t axes = 1U << static_cast<uint32_t>(input->getDimensions().nbDims - 1);
     auto* post_lnorm = addLinearNorm(net, *input, *ln_scale->getOutput(0), *ln_bias->getOutput(0), axes);
     // 6. classifier head -- take CLS token (index 0 along seq axis) via Gather
@@ -473,32 +518,14 @@ auto createEngine(const ViTConfig& cfg, IRuntime* runtime, IBuilder* builder, IB
     auto* idx_const = net->addConstant(idx_dims, cls_idx_w)->getOutput(0);
     auto* gather = net->addGather(*post_lnorm->getOutput(0), *idx_const, 1);
     auto* shuffle = net->addShuffle(*gather->getOutput(0));
-    shuffle->setReshapeDimensions(Dims2{-1, H});
-    auto* cls_w = net->addConstant(DimsHW{NC, H}, w["classifier.weight"]);
-    auto* cls_b = net->addConstant(DimsHW{1, NC}, w["classifier.bias"]);
+    shuffle->setReshapeDimensions(Dims2{-1, cfg.hidden});
+    auto* cls_w = net->addConstant(DimsHW{cfg.num_classes, cfg.hidden}, w["classifier.weight"]);
+    auto* cls_b = net->addConstant(DimsHW{1, cfg.num_classes}, w["classifier.bias"]);
     auto* cls_0 = net->addMatrixMultiply(*shuffle->getOutput(0), M::kNONE, *cls_w->getOutput(0), M::kTRANSPOSE);
     auto* cls_1 = net->addElementWise(*cls_b->getOutput(0), *cls_0->getOutput(0), E::kSUM);
     cls_1->getOutput(0)->setName(NAMES[1]);
     net->markOutput(*cls_1->getOutput(0));
 
-    Dims _min;
-    _min.nbDims = 4;
-    _min.d[0] = MIB;
-    _min.d[1] = 3;
-    _min.d[2] = IMG;
-    _min.d[3] = IMG;
-    Dims _opt;
-    _opt.nbDims = 4;
-    _opt.d[0] = OPB;
-    _opt.d[1] = 3;
-    _opt.d[2] = IMG;
-    _opt.d[3] = IMG;
-    Dims _max;
-    _max.nbDims = 4;
-    _max.d[0] = MAB;
-    _max.d[1] = 3;
-    _max.d[2] = IMG;
-    _max.d[3] = IMG;
 #if TRT_VERSION >= 8000
     config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, WORKSPACE_SIZE);
     config->setBuilderOptimizationLevel(5);
@@ -512,6 +539,9 @@ auto createEngine(const ViTConfig& cfg, IRuntime* runtime, IBuilder* builder, IB
         config->setFlag(BuilderFlag::kFP16);
     }
 #endif
+    Dims _min{.nbDims = 4, .d = {cfg.min_batch, 3, cfg.img_size, cfg.img_size}};
+    Dims _opt{.nbDims = 4, .d = {cfg.opt_batch, 3, cfg.img_size, cfg.img_size}};
+    Dims _max{.nbDims = 4, .d = {cfg.max_batch, 3, cfg.img_size, cfg.img_size}};
     auto* profile = builder->createOptimizationProfile();
     profile->setDimensions(NAMES[0], OptProfileSelector::kMIN, _min);
     profile->setDimensions(NAMES[0], OptProfileSelector::kOPT, _opt);
@@ -521,7 +551,7 @@ auto createEngine(const ViTConfig& cfg, IRuntime* runtime, IBuilder* builder, IB
     ICudaEngine* engine = runtime->deserializeCudaEngine(mem->data(), mem->size());
     delete net;
 #else
-    builder->setMaxBatchSize(MB);
+    builder->setMaxBatchSize(cfg.max_batch);
     config->setMaxWorkspaceSize(WORKSPACE_SIZE);
     ICudaEngine* engine = builder->buildEngineWithConfig(*net, *config);
     net->destroy();
@@ -568,15 +598,12 @@ std::vector<std::vector<float>> doInference(IExecutionContext& context, const vo
     };
 
 #if TRT_VERSION >= 8000
-    Dims in_dims;
-    in_dims.nbDims = 4;
-    in_dims.d[0] = static_cast<int64_t>(batchSize);
-    in_dims.d[1] = 3;
-    in_dims.d[2] = cfg.img_size;
-    in_dims.d[3] = cfg.img_size;
-    if (!context.setInputShape(NAMES[0], in_dims)) {
-        std::cerr << "setInputShape failed batch=" << batchSize << "\n";
-        std::abort();
+    if (engine.getTensorShape(NAMES[0]).d[0] == -1) {
+        Dims in_dims{.nbDims = 4, .d = {static_cast<int64_t>(batchSize), 3, cfg.img_size, cfg.img_size}};
+        if (!context.setInputShape(NAMES[0], in_dims)) {
+            std::cerr << "setInputShape failed batch=" << batchSize << "\n";
+            std::abort();
+        }
     }
 #endif
 
@@ -591,7 +618,10 @@ std::vector<std::vector<float>> doInference(IExecutionContext& context, const vo
         if (engine.getTensorIOMode(tensor_name) == TensorIOMode::kINPUT) {
             CHECK(cudaMalloc(&buffers[i], size));
             CHECK(cudaMemcpyAsync(buffers[i], input, size, cudaMemcpyHostToDevice, stream));
-            context.setTensorAddress(tensor_name, buffers[i]);
+            if (!context.setTensorAddress(tensor_name, buffers[i])) {
+                std::cerr << "setTensorAddress failed\n";
+                std::abort();
+            }
         } else {
             context.setOutputAllocator(tensor_name, allocator.get());
         }
@@ -602,7 +632,10 @@ std::vector<std::vector<float>> doInference(IExecutionContext& context, const vo
         } else {
             CHECK(cudaMalloc(&buffers[i], size));
         }
-        context.setTensorAddress(tensor_name, buffers[i]);
+        if (!context.setTensorAddress(tensor_name, buffers[i])) {
+            std::cerr << "setTensorAddress failed\n";
+            std::abort();
+        }
 #endif
 #else
         std::size_t size = batchSize * sizeOf(i) * sizeof(float);
@@ -702,21 +735,36 @@ void APIToModel(const ViTConfig& cfg, IRuntime* runtime, IHostMemory** modelStre
 // into the engine and not needed at runtime.
 static ViTConfig configFromEngine(const ICudaEngine& engine) {
     ViTConfig cfg;
-    auto in_dims = engine.getTensorShape(NAMES[0]);   // [-1, 3, H, W]
-    auto out_dims = engine.getTensorShape(NAMES[1]);  // [-1, num_classes]
+    auto in_dims = engine.getTensorShape(NAMES[0]);   // [N or -1, 3, H, W]
+    auto out_dims = engine.getTensorShape(NAMES[1]);  // [N or -1, num_classes]
     if (in_dims.nbDims != 4 || out_dims.nbDims != 2) {
         std::cerr << "Unexpected engine IO shapes\n";
         std::abort();
     }
     cfg.img_size = in_dims.d[2];
     cfg.num_classes = out_dims.d[1];
-    auto pmin = engine.getProfileShape(NAMES[0], 0, OptProfileSelector::kMIN);
-    auto popt = engine.getProfileShape(NAMES[0], 0, OptProfileSelector::kOPT);
-    auto pmax = engine.getProfileShape(NAMES[0], 0, OptProfileSelector::kMAX);
-    cfg.min_batch = pmin.d[0];
-    cfg.opt_batch = popt.d[0];
-    cfg.max_batch = pmax.d[0];
+    if (in_dims.d[0] == -1) {
+        auto pmin = engine.getProfileShape(NAMES[0], 0, OptProfileSelector::kMIN);
+        auto popt = engine.getProfileShape(NAMES[0], 0, OptProfileSelector::kOPT);
+        auto pmax = engine.getProfileShape(NAMES[0], 0, OptProfileSelector::kMAX);
+        cfg.min_batch = pmin.d[0];
+        cfg.opt_batch = popt.d[0];
+        cfg.max_batch = pmax.d[0];
+    } else {
+        cfg.min_batch = in_dims.d[0];
+        cfg.opt_batch = in_dims.d[0];
+        cfg.max_batch = in_dims.d[0];
+    }
     return cfg;
+}
+
+static auto loadLabels() -> std::map<int, std::string> {
+    auto labels = loadImagenetLabelMap(LABELS_PATH);
+    if (labels.empty()) {
+        std::cerr << "failed to load labels: " << LABELS_PATH << "\n";
+        std::abort();
+    }
+    return labels;
 }
 
 // Collect image files from a path: if a directory, return all *.jpg/*.jpeg/*.png
@@ -736,8 +784,9 @@ static std::vector<std::string> collectImages(const std::string& path) {
             if (!e.is_regular_file())
                 continue;
             auto ext = e.path().extension().string();
-            for (auto& c : ext)
-                c = std::tolower(c);
+            for (auto& c : ext) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
             if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp") {
                 out.push_back(e.path().string());
             }
@@ -761,7 +810,7 @@ auto main(int argc, char** argv) -> int {
     std::string mode = argv[1];
 
 #ifndef NDEBUG
-    gLogger.setReportableSeverity(nvinfer1::ILogger::Severity::kVERBOSE);
+    gLogger.setReportableSeverity(nvinfer1::ILogger::Severity::kINFO);
 #endif
     IRuntime* runtime = createInferRuntime(gLogger);
     assert(runtime != nullptr);
@@ -809,7 +858,11 @@ auto main(int argc, char** argv) -> int {
         file.seekg(0, file.end);
         std::streamsize size = file.tellg();
         file.seekg(0, file.beg);
-        std::vector<char> trtModelStream(size);
+        if (size <= 0) {
+            std::cerr << "empty engine file: " << engine_path << "\n";
+            return -1;
+        }
+        std::vector<char> trtModelStream(static_cast<std::size_t>(size));
         file.read(trtModelStream.data(), size);
         file.close();
 
@@ -832,7 +885,7 @@ auto main(int argc, char** argv) -> int {
             return -1;
         }
         // Cap batch to engine's max profile.
-        int64_t infer_batch = std::min<int64_t>(images.size(), cfg.max_batch);
+        int64_t infer_batch = std::min<int64_t>(static_cast<int64_t>(images.size()), cfg.max_batch);
         std::cout << "[infer] found " << images.size() << " image(s), using batch=" << infer_batch << "\n";
 
         std::vector<__half> input_buf;
@@ -843,7 +896,8 @@ auto main(int argc, char** argv) -> int {
                 std::cerr << "cannot read image: " << images[i] << "\n";
                 return -1;
             }
-            auto one = preprocess_img(img, false, mean, stdv, 1, cfg.img_size, cfg.img_size);
+            auto one = preprocess_img(img, false, mean, stdv, 1, static_cast<int32_t>(cfg.img_size),
+                                      static_cast<int32_t>(cfg.img_size));
             input_buf.insert(input_buf.end(), one.begin(), one.end());
         }
 
@@ -879,8 +933,7 @@ auto main(int argc, char** argv) -> int {
             std::cout << period.count() << "us\n";
 
             if (i == 19) {
-                auto labels =
-                        (cfg.num_classes == 1000) ? loadImagenetLabelMap(LABELS_PATH) : std::map<int, std::string>{};
+                auto labels = (cfg.num_classes == 1000) ? loadLabels() : std::map<int, std::string>{};
                 for (int64_t b = 0; b < infer_batch; ++b) {
                     std::cout << "[sample " << b << "] " << images[b] << "\n";
                     int _top = 0;

@@ -25,6 +25,7 @@ the recommended layout used by exp/run_experiment.py.
 from __future__ import annotations
 
 import argparse
+import os
 import struct
 from pathlib import Path
 
@@ -32,26 +33,34 @@ import torch
 from transformers import AutoConfig, AutoModelForImageClassification
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ASSETS_DIR = SCRIPT_DIR / "assets"
-MODELS_DIR = SCRIPT_DIR / "models"
-LABELS_FILE = ASSETS_DIR / "imagenet1000_clsidx_to_labels.txt"
-SAMPLE_IMG = ASSETS_DIR / "cats.jpg"
+REPO_ROOT = SCRIPT_DIR.parent
+MODELS_DIR = REPO_ROOT / "models"
 
 # Canonical name -> (HF hub id, image size, num classes)
 VARIANTS: dict[str, tuple[str, int, int]] = {
-    "ViT-B/16": ("google/vit-base-patch16-224",       224, 1000),
-    "ViT-B/32": ("google/vit-base-patch32-384",       384, 1000),
-    "ViT-L/16": ("google/vit-large-patch16-224",      224, 1000),
-    "ViT-L/32": ("google/vit-large-patch32-384",      384, 1000),
+    "ViT-B/16": ("google/vit-base-patch16-224", 224, 1000),
+    "ViT-B/32": ("google/vit-base-patch32-384", 384, 1000),
+    "ViT-L/16": ("google/vit-large-patch16-224", 224, 1000),
+    "ViT-L/32": ("google/vit-large-patch32-384", 384, 1000),
     "ViT-H/14": ("google/vit-huge-patch14-224-in21k", 224, 21843),
 }
 
 ALIASES: dict[str, str] = {
-    "b16": "ViT-B/16", "B16": "ViT-B/16", "B/16": "ViT-B/16",
-    "b32": "ViT-B/32", "B32": "ViT-B/32", "B/32": "ViT-B/32",
-    "l16": "ViT-L/16", "L16": "ViT-L/16", "L/16": "ViT-L/16",
-    "l32": "ViT-L/32", "L32": "ViT-L/32", "L/32": "ViT-L/32",
-    "h14": "ViT-H/14", "H14": "ViT-H/14", "H/14": "ViT-H/14",
+    "b16": "ViT-B/16",
+    "B16": "ViT-B/16",
+    "B/16": "ViT-B/16",
+    "b32": "ViT-B/32",
+    "B32": "ViT-B/32",
+    "B/32": "ViT-B/32",
+    "l16": "ViT-L/16",
+    "L16": "ViT-L/16",
+    "L/16": "ViT-L/16",
+    "l32": "ViT-L/32",
+    "L32": "ViT-L/32",
+    "L/32": "ViT-L/32",
+    "h14": "ViT-H/14",
+    "H14": "ViT-H/14",
+    "H/14": "ViT-H/14",
 }
 
 
@@ -66,8 +75,7 @@ def normalize_model_type(name: str) -> str:
         if cand in VARIANTS:
             return cand
     raise SystemExit(
-        f"Unknown model_type: {name!r}. "
-        f"Choose from: {', '.join(VARIANTS.keys())}"
+        f"Unknown model_type: {name!r}. Choose from: {', '.join(VARIANTS.keys())}"
     )
 
 
@@ -76,45 +84,14 @@ def safe_filename(model_type: str) -> str:
     return model_type.replace("/", "-")
 
 
-def read_imagenet_labels() -> dict[int, str]:
-    clsid2label: dict[int, str] = {}
-    with open(LABELS_FILE, "r") as f:
-        for line in f:
-            k, v = line.split(": ", 1)
-            clsid2label[int(k)] = v.rstrip().rstrip(",").strip().strip("'\"")
-    return clsid2label
-
-
-def maybe_sanity_check(
-    model: torch.nn.Module, img_size: int, num_classes: int
-) -> None:
-    if not SAMPLE_IMG.exists():
-        print(f"[skip] sanity check: missing {SAMPLE_IMG}")
-        return
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        print("[skip] sanity check: opencv-python / numpy not installed")
-        return
-
-    img = cv2.imread(str(SAMPLE_IMG), cv2.IMREAD_COLOR)
-    img = cv2.resize(img, (img_size, img_size), cv2.INTER_LINEAR)
-    img = (img.astype(np.float32) / 255.0 - np.array([0.5, 0.5, 0.5])) / np.array(
-        [0.5, 0.5, 0.5]
-    )
-    img = torch.from_numpy(np.transpose(img, (2, 0, 1))[None, ...]).float()
-
-    with torch.no_grad():
-        output = model(img)
-    print(f"[sanity] logits.shape={tuple(output.logits.shape)}  (expected (1,{num_classes}))")
-    if num_classes == 1000 and LABELS_FILE.exists():
-        labels = read_imagenet_labels()
-        for rank, idx in enumerate(torch.topk(output.logits[0], k=3).indices.tolist()):
-            print(f"  Top {rank}: idx={idx} label={labels.get(idx, '?')}")
-    else:
-        for rank, idx in enumerate(torch.topk(output.logits[0], k=3).indices.tolist()):
-            print(f"  Top {rank}: idx={idx}")
+def require_cache_env() -> None:
+    missing = [name for name in ("TORCH_HOME", "HF_HOME") if not os.environ.get(name)]
+    if missing:
+        raise RuntimeError(
+            f"Please set required cache environment variables: {', '.join(missing)}"
+        )
+    print(f"Using TORCH_HOME={os.environ['TORCH_HOME']}")
+    print(f"Using HF_HOME={os.environ['HF_HOME']}")
 
 
 def export_wts(model: torch.nn.Module, out_path: Path) -> None:
@@ -135,22 +112,31 @@ def export_wts(model: torch.nn.Module, out_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawTextHelpFormatter,
+        description=__doc__,
+        formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("model_type", help="e.g. ViT-B/16, ViT-L/32, b16, h14")
-    parser.add_argument("output", nargs="?", default=None,
-                        help="output .wts path (default: models/<safe_name>.wts)")
-    parser.add_argument("--no-sanity", action="store_true",
-                        help="skip the optional forward-pass sanity check")
+    parser.add_argument(
+        "output",
+        nargs="?",
+        default=None,
+        help="output .wts path (default: models/<safe_name>.wts)",
+    )
     args = parser.parse_args()
+
+    require_cache_env()
 
     model_type = normalize_model_type(args.model_type)
     hub_id, img_size, num_classes = VARIANTS[model_type]
     out_path = (
-        Path(args.output) if args.output else MODELS_DIR / f"{safe_filename(model_type)}.wts"
+        Path(args.output)
+        if args.output
+        else MODELS_DIR / f"{safe_filename(model_type)}.wts"
     )
 
-    print(f"[load] model_type={model_type}  hub_id={hub_id}  img={img_size}  classes={num_classes}")
+    print(
+        f"[load] model_type={model_type}  hub_id={hub_id}  img={img_size}  classes={num_classes}"
+    )
     config = AutoConfig.from_pretrained(hub_id)
     config._attn_implementation = "eager"
     # Force the classifier head size: in21k checkpoints (e.g. ViT-H/14) ship
@@ -160,12 +146,12 @@ def main() -> None:
     config.id2label = {i: str(i) for i in range(num_classes)}
     config.label2id = {str(i): i for i in range(num_classes)}
     model = AutoModelForImageClassification.from_pretrained(
-        hub_id, ignore_mismatched_sizes=True, config=config,
+        hub_id,
+        ignore_mismatched_sizes=True,
+        config=config,
     )
     model.eval()
 
-    if not args.no_sanity:
-        maybe_sanity_check(model, img_size, num_classes)
     export_wts(model, out_path)
 
 

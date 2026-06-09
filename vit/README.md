@@ -19,66 +19,42 @@ This is a handwritten TensorRT implementation of the Vision Transformers[arxiv.o
 - Support a dummy profiler by default
 - Support a dummy output allocator by default
 - Use optimization profile by default
-- **All five ViT sizes** from the paper: ViT-B/16, ViT-B/32, ViT-L/16, ViT-L/32, ViT-H/14
-  (variant table is shared between `gen_wts.py` and `vit.cc::getVariantConfig`)
-- **Dynamic batch** via TensorRT optimization profile (`min=1 / opt=2 / max=4`)
+- Support ViT-B/16, ViT-B/32, ViT-L/16, ViT-L/32 and ViT-H/14
+- Use an optimization profile by default (`min=1 / opt=1 / max=2`)
 
 ### 2.2 Current limitations
 
 - cannot use `IAttenion` with TensorRT SDK 10.14 ~ 10.15 because of the bugs in TensorRT
 - TensorRT < 8 is not supported because some ops are not inplemented in cuDNN
 - SM < 86, TensorRT < 10, CUDA < 12 cases are _NOT_ fully tested yet
-- ViT-H/14: HuggingFace only ships an ImageNet-21k checkpoint
-  (`google/vit-huge-patch14-224-in21k`, 21843 classes); there is no public 1k
-  fine-tuned weight file. The engine still works, but `cats.jpg` predictions
-  use 21k labels (no human-readable label map shipped here).
-
-### 2.2.1 ViT-H/14 special handling
-
-Because no public 1k checkpoint exists, ViT-H/14 has a few extra quirks:
-
-- **Random classifier weights.** When `transformers` loads the in21k
-  checkpoint, the `classifier.{weight,bias}` (`1280 -> 21843`) is
-  freshly random-initialized. `gen_wts.py` and `exp/run_experiment.py`
-  both force `config.num_labels = 21843` + `ignore_mismatched_sizes=True`
-  to materialize the classifier; otherwise HF defaults to `num_labels=2`
-  and the `.wts` ends up with a `1280 -> 2` classifier.
-- **Cross-process determinism.** Different processes get different RNG
-  seeds, so the classifier in `models/ViT-H-14.wts` does NOT match a
-  freshly-loaded `transformers` model. `exp/run_experiment.py` therefore
-  reads `classifier.{weight,bias}` back from the `.wts` and copies them
-  into the torch reference model so all 4 backends share the same
-  classifier.
-- **>2 GB ONNX export.** The `.onnx` for ViT-H/14 exceeds 2 GB so torch
-  spills initializers to external files next to it. The TensorRT
-  `OnnxParser` must read it via `parser.parse_from_file(str(path))`
-  (not `parser.parse(bytes)`), otherwise it cannot locate the external
-  data files and fails with `WeightsContext.cpp: Failed to open file: ...`.
-- **Reported accuracy.** Because the classifier is random, top-K labels
-  on `cats.jpg` are meaningless; only the cosine similarity between
-  backends is informative. Cross-backend cos-sim is still ≥ 0.9999.
+- ViT-H/14 uses the HuggingFace ImageNet-21k checkpoint
+  (`google/vit-huge-patch14-224-in21k`, 21843 classes); no public 1k
+  fine-tuned checkpoint is available.
 
 ### 2.3 Usage
 
-#### 2.3.1 Generate `.wts` for a variant
+1. use `gen_wts.py` to generate `.wts` file.
 
 ```bash
-# Choose any of: ViT-B/16, ViT-B/32, ViT-L/16, ViT-L/32, ViT-H/14
-# (aliases b16, b32, l16, l32, h14 also accepted)
+# Choose one of: ViT-B/16, ViT-B/32, ViT-L/16, ViT-L/32, ViT-H/14
+# Aliases b16, b32, l16, l32 and h14 are also accepted.
 python gen_wts.py ViT-B/16
-# -> writes models/ViT-B-16.wts (slash is replaced by hyphen for the filename)
+# -> writes models/ViT-B-16.wts
 ```
 
-#### 2.3.2 Build the C++ binary
+`gen_wts.py` sets model download caches before importing `torch` and
+`transformers`: `TORCH_HOME=/mnt/data/storage/torch` and
+`HF_HOME=/mnt/data/storage/huggingface`.
+
+2. build C++ code
 
 ```bash
 pushd tensorrtx/vit
 cmake -S . -B build -G Ninja --fresh
-cmake --build build -j$(($(nproc)/2))
-popd
+cmake --build build
 ```
 
-#### 2.3.3 Serialize `.wts` -> TensorRT engine (dynamic batch 1/2/4)
+3. serialize `.wts` model to engine file.
 
 ```bash
 ./build/vit -s <wts_path> <engine_path> <model_type>
@@ -86,49 +62,18 @@ popd
 ./build/vit -s models/ViT-B-16.wts models/ViT-B-16.engine ViT-B/16
 ```
 
-**Build precision and dynamic-batch profile are configured in code, not on
-the CLI.** Edit the constants near the top of `vit.cc` and rebuild:
-
-```cpp
-// vit.cc
-static constexpr DataType BUILD_PRECISION = DataType::kHALF;  // FP16 (default)
-// static constexpr DataType BUILD_PRECISION = DataType::kFLOAT; // FP32 (reference)
-static constexpr int64_t BUILD_MIN_BATCH = 1;
-static constexpr int64_t BUILD_OPT_BATCH = 2;
-static constexpr int64_t BUILD_MAX_BATCH = 4;
-```
-
-The strongly-typed network (TRT 10+) propagates `BUILD_PRECISION` through
-the whole graph, including the input tensor; no `BuilderFlag::kFP16` is
-needed (and in fact rejected on strongly-typed networks). The `-d`
-runtime mode auto-detects the engine input dtype, so the same binary
-handles both FP16 and FP32 engines. FP32 engines are roughly 2× larger
-and slower than FP16 but provide the numerical reference.
-
-#### 2.3.4 Run inference on a directory of images
+4. run inference
 
 ```bash
-./build/vit -d <engine_path> <image_dir>
-# Examples:
-./build/vit -d models/ViT-B-16.engine assets/                # all jpgs in assets/
-./build/vit -d models/ViT-B-16.engine assets/cats.jpg        # single image OK too
+./build/vit -d <engine_path> <image_or_image_dir>
+# Example:
+./build/vit -d models/ViT-B-16.engine assets/cats.jpg
 ```
 
-The runtime batch is `min(num_images, engine_max_batch=4)`. To benchmark a
-specific batch, simply put exactly that many images in the directory.
+The engine uses a dynamic batch profile (`min=1 / opt=1 / max=2`). Passing a
+directory with two images runs both samples in one batch.
 
-#### 2.3.5 Cross-backend precision & latency comparison (PyTorch / ORT / TRT-onnx / TRT-wts)
-
-```bash
-python exp/run_experiment.py                                 # all variants, batches 1 2 4
-python exp/run_experiment.py --variants ViT-B/16 ViT-L/16    # subset
-python exp/run_experiment.py --variants ViT-B/16 --batches 1 4
-```
-
-Prerequisites: corresponding `models/<safe(V)>.wts` and `models/<safe(V)>.engine`
-exist; `safe()` replaces `/` with `-`.
-
-### 2.4 Reference output (legacy single-variant build, RTX 4080, TRT 10.15.1)
+On **RTX 4080, TensorRT 10.15.1 SDK**, the output looks like:
 
 ```bash
 ...
@@ -184,9 +129,7 @@ Where:
 
 - (N): batch size (represented by `N` in your code)
 - (L): sequence length (number of tokens; dynamic in code via `-1`)
-- (D): hidden size, set per variant via `getVariantConfig()` (768 for ViT-B,
-  1024 for ViT-L, 1280 for ViT-H). The numeric examples below use ViT-B/16
-  ((D = 768), (4D = 3072)) for concreteness.
+- (D): hidden size, configured by the selected variant
 
 The attention head configuration:
 
@@ -217,7 +160,7 @@ For a standard Transformer block:
   $$
   \mathbf{W}_2 \in \mathbb{R}^{4D \times D}, \ \mathbf{b}_2 \in \mathbb{R}^{D}
   $$
-  Here ($4 D = 3072$).
+  Here the FFN dimension is configured by the selected variant.
 
 ### 3.3 High-Level Block Structure
 

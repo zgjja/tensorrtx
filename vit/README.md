@@ -19,20 +19,32 @@ This is a handwritten TensorRT implementation of the Vision Transformers[arxiv.o
 - Support a dummy profiler by default
 - Support a dummy output allocator by default
 - Use optimization profile by default
+- Support ViT-B/16, ViT-B/32, ViT-L/16, ViT-L/32 and ViT-H/14
+- Use an optimization profile by default (`min=1 / opt=1 / max=2`)
 
 ### 2.2 Current limitations
 
 - cannot use `IAttenion` with TensorRT SDK 10.14 ~ 10.15 because of the bugs in TensorRT
 - TensorRT < 8 is not supported because some ops are not inplemented in cuDNN
 - SM < 86, TensorRT < 10, CUDA < 12 cases are _NOT_ fully tested yet
+- ViT-H/14 uses the HuggingFace ImageNet-21k checkpoint
+  (`google/vit-huge-patch14-224-in21k`, 21843 classes); no public 1k
+  fine-tuned checkpoint is available.
 
 ### 2.3 Usage
 
 1. use `gen_wts.py` to generate `.wts` file.
 
 ```bash
-python gen_wts.py
+# Choose one of: ViT-B/16, ViT-B/32, ViT-L/16, ViT-L/32, ViT-H/14
+# Aliases b16, b32, l16, l32 and h14 are also accepted.
+python gen_wts.py ViT-B/16
+# -> writes models/ViT-B-16.wts
 ```
+
+`gen_wts.py` sets model download caches before importing `torch` and
+`transformers`: `TORCH_HOME=/mnt/data/storage/torch` and
+`HF_HOME=/mnt/data/storage/huggingface`.
 
 2. build C++ code
 
@@ -45,14 +57,21 @@ cmake --build build
 3. serialize `.wts` model to engine file.
 
 ```bash
-./build/vit -s
+./build/vit -s <wts_path> <engine_path> <model_type>
+# Example:
+./build/vit -s models/ViT-B-16.wts models/ViT-B-16.engine ViT-B/16
 ```
 
 4. run inference
 
 ```bash
-./build/vit -d
+./build/vit -d <engine_path> <image_or_image_dir>
+# Example:
+./build/vit -d models/ViT-B-16.engine assets/cats.jpg
 ```
+
+The engine uses a dynamic batch profile (`min=1 / opt=1 / max=2`). Passing a
+directory with two images runs both samples in one batch.
 
 On **RTX 4080, TensorRT 10.15.1 SDK**, the output looks like:
 
@@ -110,7 +129,7 @@ Where:
 
 - (N): batch size (represented by `N` in your code)
 - (L): sequence length (number of tokens; dynamic in code via `-1`)
-- (D): hidden size, fixed at 768 in this implementation
+- (D): hidden size, configured by the selected variant
 
 The attention head configuration:
 
@@ -141,7 +160,7 @@ For a standard Transformer block:
   $$
   \mathbf{W}_2 \in \mathbb{R}^{4D \times D}, \ \mathbf{b}_2 \in \mathbb{R}^{D}
   $$
-  Here ($4 D = 3072$).
+  Here the FFN dimension is configured by the selected variant.
 
 ### 3.3 High-Level Block Structure
 

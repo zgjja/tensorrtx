@@ -3,20 +3,23 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
-#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <opencv2/opencv.hpp>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include "macros.h"
 
 using namespace nvinfer1;
+
+constexpr const std::size_t WORKSPACE_SIZE = 16 << 20;
 
 #define CHECK(status)                                     \
     do {                                                  \
@@ -68,16 +71,25 @@ static std::map<std::string, nvinfer1::Weights> loadWeights(const std::string& f
         input >> name >> std::dec >> wt.count;
 
         // Load blob
-        auto* val = new uint32_t[static_cast<std::size_t>(wt.count)];
+        auto* val = new float[wt.count];
         input >> std::hex;
         for (auto x = 0ll; x < wt.count; ++x) {
-            input >> val[x];
+            uint32_t bits;
+            input >> bits;
+            std::memcpy(&val[x], &bits, sizeof(bits));
         }
         wt.values = val;
         weightMap[name] = wt;
     }
 
     return weightMap;
+}
+
+static void releaseWeights(std::map<std::string, nvinfer1::Weights>& weightMap) {
+    for (auto& weight : weightMap) {
+        delete[] static_cast<const float*>(weight.second.values);
+        weight.second.values = nullptr;
+    }
 }
 
 /**
@@ -122,7 +134,7 @@ static std::vector<float> preprocess_img(cv::Mat& img, bool bgr2rgb, const std::
     return chw;
 }
 
-static auto topk(const std::vector<float>& v, int k) -> std::vector<std::pair<int, float>> {
+static std::vector<std::pair<int, float>> topk(const std::vector<float>& v, int k) {
     if (k <= 0)
         return {};
     auto stride = std::min<std::ptrdiff_t>(k, static_cast<std::ptrdiff_t>(v.size()));
@@ -133,7 +145,7 @@ static auto topk(const std::vector<float>& v, int k) -> std::vector<std::pair<in
     std::partial_sort(idx.begin(), idx.begin() + stride, idx.end(), [&](int a, int b) { return v[a] > v[b]; });
 
     std::vector<std::pair<int, float>> out;
-    out.reserve(static_cast<std::size_t>(stride));
+    out.reserve(stride);
     for (auto i = 0; i < stride; ++i)
         out.emplace_back(idx[i], v[idx[i]]);
     return out;
@@ -235,7 +247,7 @@ static ILayer* addTransformLayer(INetworkDefinition* network, ITensor& input, bo
     return trans;
 }
 
-static std::size_t getSize(DataType dt) {
+static size_t getSize(DataType dt) {
     switch (dt) {
 #if TRT_VERSION >= 8510
         case DataType::kUINT8:

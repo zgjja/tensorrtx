@@ -43,36 +43,25 @@ add_library(TensorRT IMPORTED INTERFACE)
 add_library(TensorRT::TensorRT ALIAS TensorRT)
 
 set(TRT_VERSION
-    "$ENV{TRT_VERSION}"
     CACHE
       STRING
       "TensorRT version, e.g. \"8.6.1.6\" or \"8.6.1.6+cuda12.0.1.011\", \"8.6.1.6.Windows10.x86_64.cuda-12.0\" etc"
 )
 
-if(NOT "${TRT_VERSION}" STREQUAL "" AND NOT "$ENV{TRT_VERSION}" STREQUAL ""
-   AND NOT "${TRT_VERSION}" STREQUAL "$ENV{TRT_VERSION}")
+if(NOT TRT_VERSION STREQUAL "" AND NOT $ENV{TRT_VERSION} STREQUAL "")
   message(
     WARNING
-      "TRT_VERSION defined by cmake and environment variable both, using the environment variable"
+      "TRT_VERSION defined by cmake and environment variable both, using the later one"
   )
 endif()
 
-if(NOT "$ENV{TRT_VERSION}" STREQUAL "")
-  set(TRT_VERSION
-      "$ENV{TRT_VERSION}"
-      CACHE STRING "TensorRT version" FORCE)
+if(NOT $ENV{TRT_VERSION} STREQUAL "")
+  set(TRT_VERSION $ENV{TRT_VERSION})
 endif()
 
-if("${TRT_VERSION}" STREQUAL "")
-  message(FATAL_ERROR "Please set the TRT_VERSION environment variable")
-endif()
-
-string(REGEX MATCH "^[0-9]+" _match "${TRT_VERSION}")
+string(REGEX MATCH "([0-9]+)" _match ${TRT_VERSION})
 set(TRT_MAJOR_VERSION "${_match}")
 unset(_match)
-if("${TRT_MAJOR_VERSION}" STREQUAL "")
-  message(FATAL_ERROR "Failed to parse TensorRT major version from ${TRT_VERSION}")
-endif()
 
 if(WIN32)
   set(TensorRT_DIR "C:/Program Files/TensorRT-${TRT_VERSION}")

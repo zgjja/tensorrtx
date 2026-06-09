@@ -1,83 +1,85 @@
+import argparse
+import os
 import struct
+from pathlib import Path
 
-import cv2
-import numpy as np
 import torch
-from torchvision.models.shufflenetv2 import (
-    shufflenet_v2_x0_5,
-    shufflenet_v2_x1_0,
-    shufflenet_v2_x1_5,
-    shufflenet_v2_x2_0,
+from torchvision import models
+
+
+MODEL_NAMES = (
+    "shufflenet_v2_x0_5",
+    "shufflenet_v2_x1_0",
+    "shufflenet_v2_x1_5",
+    "shufflenet_v2_x2_0",
 )
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+MODELS_DIR = REPO_ROOT / "models"
 
 
-def read_imagenet_labels() -> dict[int, str]:
-    """
-    read ImageNet 1000 labels
-
-    Returns:
-        dict[int, str]: labels dict
-    """
-    clsid2label = {}
-    with open("../assets/imagenet1000_clsidx_to_labels.txt", "r") as f:
-        for i in f.readlines():
-            k, v = i.split(": ")
-            clsid2label.setdefault(int(k), v[1:-3])
-    return clsid2label
+def require_cache_env() -> None:
+    missing = [name for name in ("TORCH_HOME", "HF_HOME") if not os.environ.get(name)]
+    if missing:
+        raise RuntimeError(
+            f"Please set required cache environment variables: {', '.join(missing)}"
+        )
+    print(f"Using TORCH_HOME={os.environ['TORCH_HOME']}")
+    print(f"Using HF_HOME={os.environ['HF_HOME']}")
 
 
-def preprocess(img: np.array) -> torch.Tensor:
-    """
-    a preprocess method align with ImageNet dataset
+def build_model(name: str) -> torch.nn.Module:
+    suffix = name.removeprefix("shufflenet_").upper()
+    weights_cls = getattr(models, f"ShuffleNet_{suffix}_Weights")
+    model_fn = getattr(models, name)
+    model = model_fn(weights=weights_cls.DEFAULT)
+    model.eval()
+    return model
 
-    Args:
-        img (np.array): input image
 
-    Returns:
-        torch.Tensor: preprocessed image in `NCHW` layout
-    """
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_LINEAR)
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    img = (img - mean) / std
-    img = img.transpose(2, 0, 1)[None, ...]
-    return torch.from_numpy(img)
+def write_wts(model: torch.nn.Module, output_path: Path) -> None:
+    state_dict = model.state_dict()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w") as f:
+        f.write(f"{len(state_dict.keys())}\n")
+        for key, value in state_dict.items():
+            values = value.reshape(-1).cpu().numpy()
+            f.write(f"{key} {len(values)}")
+            for item in values:
+                f.write(" ")
+                f.write(struct.pack(">f", float(item)).hex())
+            f.write("\n")
+    size_mib = output_path.stat().st_size / 1024 / 1024
+    print(f"[ok] wrote {output_path} ({size_mib:.1f} MiB, {len(state_dict)} tensors)")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Export torchvision ShuffleNetV2 weights to tensorrtx .wts files."
+    )
+    parser.add_argument(
+        "--model",
+        choices=MODEL_NAMES,
+        action="append",
+        help="ShuffleNetV2 variant to export. Repeat for multiple variants. Defaults to all variants.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=MODELS_DIR,
+        help="Directory for generated .wts files.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    require_cache_env()
+    model_names = args.model or MODEL_NAMES
+    for model_name in model_names:
+        print(f"writing {model_name}.wts")
+        write_wts(build_model(model_name), args.output_dir / f"{model_name}.wts")
 
 
 if __name__ == "__main__":
-    labels = read_imagenet_labels()
-    img = cv2.imread("../assets/cats.jpg", cv2.IMREAD_COLOR)
-    img = preprocess(img)
-
-    """
-    NOTE: comment out the model you don't want
-    """
-    models = [
-        ("shufflenet_v2_x0_5", shufflenet_v2_x0_5(pretrained=True)),
-        ("shufflenet_v2_x1_0", shufflenet_v2_x1_0(pretrained=True)),
-        ("shufflenet_v2_x1_5", shufflenet_v2_x1_5(pretrained=True)),
-        ("shufflenet_v2_x2_0", shufflenet_v2_x2_0(pretrained=True)),
-    ]
-
-    for name, model in models:
-        model.eval()
-        with torch.inference_mode():
-            output = model(img)
-        print(f"{name} result:")
-        for i, batch in enumerate(torch.topk(output, k=3).indices):
-            for j, idx in enumerate(batch):
-                print(f"\tBatch: {i}, Top: {j}, logits: {output[i][idx]:.4f}, label: {labels[int(idx)]}")
-        print(f"{'=' * 32}")
-
-        with open(f"../models/{name}.wts", "w") as f:
-            f.write("{}\n".format(len(model.state_dict().keys())))
-            for k, v in model.state_dict().items():
-                print("key: ", k)
-                print("value: ", v.shape)
-                vr = v.reshape(-1).cpu().numpy()
-                f.write("{} {}".format(k, len(vr)))
-                for vv in vr:
-                    f.write(" ")
-                    f.write(struct.pack(">f", float(vv)).hex())
-                f.write("\n")
+    main()

@@ -1,85 +1,98 @@
 #include <NvInfer.h>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <opencv2/opencv.hpp>
+#include <string>
 #include <vector>
 #include "logging.h"
 #include "utils.h"
 
-// stuff we know about squeezenet
-static constexpr const int N = 1;
-static constexpr const int INPUT_H = 224;
-static constexpr const int INPUT_W = 224;
-static constexpr const int SIZES[] = {3 * INPUT_H * INPUT_W, N * 1000};
-static constexpr const char* NAMES[] = {"data", "prob"};
-static constexpr const bool TRT_PREPROCESS = TRT_VERSION >= 8510 ? true : false;
-static constexpr const float mean[3] = {0.485f, 0.456f, 0.406f};
-static constexpr const float stdv[3] = {0.229f, 0.224f, 0.225f};
+static constexpr const std::size_t WORKSPACE_SIZE = 16 << 20;
 
-static constexpr const char* WTS_PATH = "../models/squeezenet.wts";
-static constexpr const char* ENGINE_PATH = "../models/squeezenet.engine";
-static constexpr const char* LABELS_PATH = "../assets/imagenet1000_clsidx_to_labels.txt";
+static constexpr const int64_t N = 1;
+static constexpr const int32_t INPUT_H = 224;
+static constexpr const int32_t INPUT_W = 224;
+static constexpr const std::array<int32_t, 2> SIZES = {3 * INPUT_H * INPUT_W, N * 1000};
+static constexpr const std::array<const char*, 2> NAMES = {"data", "prob"};
+static constexpr const bool TRT_PREPROCESS = TRT_VERSION >= 8510 ? true : false;
+static constexpr const std::array<const float, 3> mean = {0.485f, 0.456f, 0.406f};
+static constexpr const std::array<const float, 3> stdv = {0.229f, 0.224f, 0.225f};
+
+static constexpr const char* WTS_PATH = "models/squeezenet.wts";
+static constexpr const char* ENGINE_PATH = "models/squeezenet.engine";
+static constexpr const char* LABELS_PATH = "assets/imagenet1000_clsidx_to_labels.txt";
 
 using namespace nvinfer1;
 using WeightMap = std::map<std::string, Weights>;
+using NDCF = nvinfer1::NetworkDefinitionCreationFlag;
 
 static Logger gLogger;
 
-ILayer* fire(INetworkDefinition* network, WeightMap& m, ITensor& input, const std::string& lname,
-             int32_t squeeze_planes, int32_t e1x1_planes, int32_t e3x3_planes) {
-    auto* conv1 = network->addConvolutionNd(input, squeeze_planes, DimsHW{1, 1}, m[lname + "squeeze.weight"],
-                                            m[lname + "squeeze.bias"]);
+static auto fire(INetworkDefinition* network, WeightMap& weights, ITensor& input, const std::string& lname,
+                 int32_t squeeze_planes, int32_t e1x1_planes, int32_t e3x3_planes) -> ILayer* {
+    auto* conv1 = network->addConvolutionNd(input, squeeze_planes, DimsHW{1, 1}, weights.at(lname + "squeeze.weight"),
+                                            weights.at(lname + "squeeze.bias"));
     assert(conv1);
-    auto* relu1 = network->addActivation(*conv1->getOutput(0), ActivationType::kRELU)->getOutput(0);
+    auto* relu1 = network->addActivation(*conv1->getOutput(0), ActivationType::kRELU);
+    assert(relu1);
 
     std::string _c = lname + "expand1x1";
-    auto* conv2 = network->addConvolutionNd(*relu1, e1x1_planes, DimsHW{1, 1}, m[_c + ".weight"], m[_c + ".bias"]);
+    auto* conv2 = network->addConvolutionNd(*relu1->getOutput(0), e1x1_planes, DimsHW{1, 1}, weights.at(_c + ".weight"),
+                                            weights.at(_c + ".bias"));
     assert(conv2);
     auto* relu2 = network->addActivation(*conv2->getOutput(0), ActivationType::kRELU);
     assert(relu2);
 
     _c = lname + "expand3x3";
-    auto* conv3 = network->addConvolutionNd(*relu1, e3x3_planes, DimsHW{3, 3}, m[_c + ".weight"], m[_c + ".bias"]);
+    auto* conv3 = network->addConvolutionNd(*relu1->getOutput(0), e3x3_planes, DimsHW{3, 3}, weights.at(_c + ".weight"),
+                                            weights.at(_c + ".bias"));
     assert(conv3);
     conv3->setPaddingNd(DimsHW{1, 1});
     auto* relu3 = network->addActivation(*conv3->getOutput(0), ActivationType::kRELU);
     assert(relu3);
 
-    ITensor* inputTensors[] = {relu2->getOutput(0), relu3->getOutput(0)};
-    auto* concat = network->addConcatenation(inputTensors, 2);
+    std::array<ITensor*, 2> inputTensors = {relu2->getOutput(0), relu3->getOutput(0)};
+    auto* concat = network->addConcatenation(inputTensors.data(), 2);
     assert(concat);
     return concat;
 }
 
-// Creat the engine using only the API and not any parser.
-ICudaEngine* createEngine(int32_t N, IRuntime* runtime, IBuilder* builder, IBuilderConfig* config, DataType dt) {
+// Create the engine using only the API and not any parser.
+static auto createEngine(int32_t batch_size, IRuntime* runtime, IBuilder* builder, IBuilderConfig* config,
+                         DataType dt) -> ICudaEngine* {
     auto weightMap = loadWeights(WTS_PATH);
-#if TRT_VERSION >= 10000
-    auto* network = builder->createNetworkV2(0);
+
+#if TRT_VERSION >= 11200
+    auto flag = 1U << static_cast<int>(NDCF::kSTRONGLY_TYPED);
+#elif TRT_VERSION >= 10000
+    auto flag = 0U;
 #else
-    auto* network = builder->createNetworkV2(1u << static_cast<int>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH));
+    auto flag = 1U << static_cast<int>(NDCF::kEXPLICIT_BATCH);
 #endif
+    auto* network = builder->createNetworkV2(flag);
 
     ITensor* data{nullptr};
     if constexpr (TRT_PREPROCESS) {
-#if TRT_VERSION > 8510
         dt = DataType::kUINT8;
-#else
-        dt = DataType::kINT8;
-#endif
-        data = network->addInput(NAMES[0], dt, Dims4{N, INPUT_H, INPUT_W, 3});
+        data = network->addInput(NAMES[0], dt, Dims4{batch_size, INPUT_H, INPUT_W, 3});
         auto* trans = addTransformLayer(network, *data, true, mean, stdv);
         data = trans->getOutput(0);
     } else {
-        data = network->addInput(NAMES[0], dt, Dims4{N, 3, INPUT_H, INPUT_W});
+        data = network->addInput(NAMES[0], dt, Dims4{batch_size, 3, INPUT_H, INPUT_W});
     }
     assert(data);
 
-    auto* conv1 = network->addConvolutionNd(*data, 64, DimsHW{3, 3}, weightMap["features.0.weight"],
-                                            weightMap["features.0.bias"]);
+    auto* conv1 = network->addConvolutionNd(*data, 64, DimsHW{3, 3}, weightMap.at("features.0.weight"),
+                                            weightMap.at("features.0.bias"));
     assert(conv1);
     conv1->setStrideNd(DimsHW{2, 2});
     auto* relu1 = network->addActivation(*conv1->getOutput(0), ActivationType::kRELU);
@@ -113,8 +126,8 @@ ICudaEngine* createEngine(int32_t N, IRuntime* runtime, IBuilder* builder, IBuil
     cat1 = fire(network, weightMap, *cat1->getOutput(0), "features.12.", 64, 256, 256);
 
     // classifier
-    auto* conv2 = network->addConvolutionNd(*cat1->getOutput(0), 1000, DimsHW{1, 1}, weightMap["classifier.1.weight"],
-                                            weightMap["classifier.1.bias"]);
+    auto* conv2 = network->addConvolutionNd(*cat1->getOutput(0), 1000, DimsHW{1, 1},
+                                            weightMap.at("classifier.1.weight"), weightMap.at("classifier.1.bias"));
     assert(conv2);
     auto* relu2 = network->addActivation(*conv2->getOutput(0), ActivationType::kRELU);
     assert(relu2);
@@ -129,33 +142,47 @@ ICudaEngine* createEngine(int32_t N, IRuntime* runtime, IBuilder* builder, IBuil
     config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, WORKSPACE_SIZE);
     IHostMemory* mem = builder->buildSerializedNetwork(*network, *config);
     auto* engine = runtime->deserializeCudaEngine(mem->data(), mem->size());
+    delete mem;
     delete network;
 #else
-    builder->setMaxBatchSize(N);
+    builder->setMaxBatchSize(batch_size);
     config->setMaxWorkspaceSize(WORKSPACE_SIZE);
     auto* engine = builder->buildEngineWithConfig(*network, *config);
     network->destroy();
 #endif
-    std::cout << "build out" << std::endl;
+    std::cout << "build finished\n";
 
     // Release host memory
     for (auto& mem : weightMap) {
-        free((void*)(mem.second.values));
+        delete[] static_cast<const uint32_t*>(mem.second.values);
     }
 
     return engine;
 }
 
-void APIToModel(int32_t N, IRuntime* runtime, IHostMemory** modelStream) {
-    // Create builder
+static void destroyRuntime(IRuntime* runtime) {
+#if TRT_VERSION >= 8000
+    delete runtime;
+#else
+    runtime->destroy();
+#endif
+}
+
+static void destroyHostMemory(IHostMemory* memory) {
+#if TRT_VERSION >= 8000
+    delete memory;
+#else
+    memory->destroy();
+#endif
+}
+
+static void APIToModel(int32_t batch_size, IRuntime* runtime, IHostMemory** modelStream) {
     auto* builder = createInferBuilder(gLogger);
     auto* config = builder->createBuilderConfig();
 
-    // Create model to populate the network, then set the outputs and create an engine
-    auto* engine = createEngine(N, runtime, builder, config, DataType::kFLOAT);
+    auto* engine = createEngine(batch_size, runtime, builder, config, DataType::kFLOAT);
     assert(engine != nullptr);
 
-    // Serialize the engine
     (*modelStream) = engine->serialize();
 
 #if TRT_VERSION >= 8000
@@ -169,7 +196,8 @@ void APIToModel(int32_t N, IRuntime* runtime, IHostMemory** modelStream) {
 #endif
 }
 
-std::vector<std::vector<float>> doInference(IExecutionContext& context, void* input, int32_t batch_size) {
+static auto doInference(IExecutionContext& context, void* input,
+                        int64_t batch_size) -> std::vector<std::vector<float>> {
     const auto& engine = context.getEngine();
     cudaStream_t stream;
     CHECK(cudaStreamCreate(&stream));
@@ -192,7 +220,10 @@ std::vector<std::vector<float>> doInference(IExecutionContext& context, void* in
         if (i == 0) {
             CHECK(cudaMemcpyAsync(buffers[i], input, size, cudaMemcpyHostToDevice, stream));
         }
-        context.setTensorAddress(tensor_name, buffers[i]);
+        if (!context.setTensorAddress(tensor_name, buffers[i])) {
+            std::cerr << "setTensorAddress failed\n";
+            std::abort();
+        }
 #else
         const int32_t idx = engine.getBindingIndex(NAMES[i]);
         auto s = getSize(engine.getBindingDataType(idx));
@@ -206,21 +237,27 @@ std::vector<std::vector<float>> doInference(IExecutionContext& context, void* in
     }
 
 #if TRT_VERSION >= 8000
-    assert(context.enqueueV3(stream));
+    if (!context.enqueueV3(stream)) {
+        std::cerr << "enqueueV3 failed\n";
+        std::abort();
+    }
 #else
-    assert(context.enqueueV2(buffers.data(), stream, nullptr));
+    if (!context.enqueueV2(buffers.data(), stream, nullptr)) {
+        std::cerr << "enqueueV2 failed\n";
+        std::abort();
+    }
 #endif
 
     std::vector<std::vector<float>> prob;
     for (int i = 1; i < nIO; ++i) {
-        std::vector<float> tmp(batch_size * SIZES[i], std::nan(""));
+        std::vector<float> tmp(batch_size * SIZES[i], std::nanf(""));
         std::size_t size = batch_size * SIZES[i] * sizeof(float);
         CHECK(cudaMemcpyAsync(tmp.data(), buffers[i], size, cudaMemcpyDeviceToHost, stream));
         prob.emplace_back(tmp);
     }
     CHECK(cudaStreamSynchronize(stream));
 
-    cudaStreamDestroy(stream);
+    CHECK(cudaStreamDestroy(stream));
     for (auto i = 0; i < nIO; ++i) {
         CHECK(cudaFree(buffers[i]));
     }
@@ -230,9 +267,9 @@ std::vector<std::vector<float>> doInference(IExecutionContext& context, void* in
 int main(int argc, char** argv) {
     checkTrtEnv();
     if (argc != 2) {
-        std::cerr << "arguments not right!" << std::endl;
-        std::cerr << "./squeezenet -s   // serialize model to plan file" << std::endl;
-        std::cerr << "./squeezenet -d   // deserialize plan file and run inference" << std::endl;
+        std::cerr << "arguments not right!\n";
+        std::cerr << "./squeezenet -s   // serialize model to plan file\n";
+        std::cerr << "./squeezenet -d   // deserialize plan file and run inference\n";
         return -1;
     }
 
@@ -240,7 +277,7 @@ int main(int argc, char** argv) {
     auto* runtime = createInferRuntime(gLogger);
     assert(runtime != nullptr);
     char* trtModelStream{nullptr};
-    size_t size{0};
+    std::streamsize size{0};
 
     if (std::string(argv[1]) == "-s") {
         IHostMemory* modelStream{nullptr};
@@ -249,15 +286,22 @@ int main(int argc, char** argv) {
 
         std::ofstream p(ENGINE_PATH, std::ios::binary | std::ios::trunc);
         if (!p) {
-            std::cerr << "could not open plan output file" << std::endl;
+            std::cerr << "could not open plan output file\n";
+            destroyHostMemory(modelStream);
+            destroyRuntime(runtime);
             return -1;
         }
-        p.write(reinterpret_cast<const char*>(modelStream->data()), modelStream->size());
-#if TRT_VERSION >= 8000
-        delete modelStream;
-#else
-        modelStream->destroy();
-#endif
+        if (modelStream->size() > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
+            std::cerr << "this model is too large to serialize\n";
+            destroyHostMemory(modelStream);
+            destroyRuntime(runtime);
+            return -1;
+        }
+        const auto* data_ptr = reinterpret_cast<const char*>(modelStream->data());
+        auto data_size = static_cast<std::streamsize>(modelStream->size());
+        p.write(data_ptr, data_size);
+        destroyHostMemory(modelStream);
+        destroyRuntime(runtime);
         return 0;
     } else if (std::string(argv[1]) == "-d") {
         std::ifstream file(ENGINE_PATH, std::ios::binary);
@@ -269,8 +313,13 @@ int main(int argc, char** argv) {
             assert(trtModelStream);
             file.read(trtModelStream, size);
             file.close();
+        } else {
+            std::cerr << "could not open engine file\n";
+            destroyRuntime(runtime);
+            return -1;
         }
     } else {
+        destroyRuntime(runtime);
         return -1;
     }
 
@@ -288,54 +337,55 @@ int main(int argc, char** argv) {
     cv::Mat img;
     if constexpr (TRT_PREPROCESS) {
         // for simplicity, resize image on cpu side
-        img = cv::imread("../assets/cats.jpg", cv::IMREAD_COLOR);
+        img = cv::imread("assets/cats.jpg", cv::IMREAD_COLOR);
+        assert(!img.empty());
         cv::resize(img, img, cv::Size(INPUT_W, INPUT_H), 0, 0, cv::INTER_LINEAR);
         input = static_cast<void*>(img.data);
     } else {
-        img = cv::imread("../assets/cats.jpg", cv::IMREAD_COLOR);
+        img = cv::imread("assets/cats.jpg", cv::IMREAD_COLOR);
+        assert(!img.empty());
         flat_img = preprocess_img(img, true, mean, stdv, N, INPUT_H, INPUT_W);
         input = flat_img.data();
     }
+    assert(input);
 
     for (int32_t i = 0; i < 100; ++i) {
         auto _start = std::chrono::system_clock::now();
         auto prob = doInference(*context, input, N);
         auto _end = std::chrono::system_clock::now();
         auto _time = std::chrono::duration_cast<std::chrono::microseconds>(_end - _start).count();
-        std::cout << "Execution time: " << _time << "us" << std::endl;
+        std::cout << "Execution time: " << _time << "us\n";
 
-        for (auto vector : prob) {
+        for (const auto& vector : prob) {
             int idx = 0;
             for (auto v : vector) {
                 std::cout << std::setprecision(4) << v << ", " << std::flush;
                 if (++idx > 20) {
-                    std::cout << "\n====" << std::endl;
+                    std::cout << "\n====\n";
                     break;
                 }
             }
         }
 
         if (i == 99) {
-            std::cout << "prediction result: " << std::endl;
+            std::cout << "prediction result:\n";
             auto labels = loadImagenetLabelMap(LABELS_PATH);
             int _top = 0;
-            for (auto& [idx, logits] : topk(prob[0], 3)) {
+            for (const auto& [idx, logits] : topk(prob[0], 3)) {
                 std::cout << "Top: " << _top++ << " idx: " << idx << ", logits: " << logits
-                          << ", label: " << labels[idx] << std::endl;
+                          << ", label: " << labels[idx] << "\n";
             }
         }
     }
 
     delete[] trtModelStream;
-    // Destroy the engine
 #if TRT_VERSION >= 8000
     delete context;
     delete engine;
-    delete runtime;
 #else
     context->destroy();
     engine->destroy();
-    runtime->destroy();
 #endif
+    destroyRuntime(runtime);
     return 0;
 }

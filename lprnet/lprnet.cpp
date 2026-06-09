@@ -3,6 +3,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -314,7 +315,10 @@ auto doInference(IExecutionContext& context, void* input, int64_t batchSize) -> 
         if (i == 0) {
             CHECK(cudaMemcpyAsync(buffers[i], input, size, cudaMemcpyHostToDevice, stream));
         }
-        context.setTensorAddress(tensor_name, buffers[i]);
+        if (!context.setTensorAddress(tensor_name, buffers[i])) {
+            std::cerr << "setTensorAddress failed\n";
+            std::abort();
+        }
 #else
         const int32_t idx = engine.getBindingIndex(NAMES[i]);
         auto s = getSize(engine.getBindingDataType(idx));
@@ -328,9 +332,15 @@ auto doInference(IExecutionContext& context, void* input, int64_t batchSize) -> 
     }
 
 #if TRT_VERSION >= 8000
-    assert(context.enqueueV3(stream));
+    if (!context.enqueueV3(stream)) {
+        std::cerr << "enqueueV3 failed\n";
+        std::abort();
+    }
 #else
-    assert(context.enqueueV2(buffers.data(), stream, nullptr));
+    if (!context.enqueueV2(buffers.data(), stream, nullptr)) {
+        std::cerr << "enqueueV2 failed\n";
+        std::abort();
+    }
 #endif
 
     std::vector<std::vector<float>> prob;

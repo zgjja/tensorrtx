@@ -1,26 +1,37 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.14)
 
-project(csrnet)
+project(
+  csrnet
+  VERSION 0.1
+  LANGUAGES C CXX)
 
-add_definitions(-std=c++11)
-add_definitions(-DAPI_EXPORTS)
-option(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
-set(CMAKE_CXX_STANDARD 11)
-set(CMAKE_BUILD_TYPE Debug)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 80 86 89 90 100 120)
+endif()
 
-# cuda
-include_directories(/usr/local/cuda/targets/x86_64-linux/include )
-link_directories(/usr/local/cuda/targets/x86_64-linux/lib)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_INCLUDE_CURRENT_DIR TRUE)
 
-# tensorrt
-include_directories(/usr/include/x86_64-linux-gnu/)
-link_directories(/usr/lib/x86_64-linux-gnu/)
+option(CUDA_USE_STATIC_CUDA_RUNTIME "Use static cudaruntime library" OFF)
 
-# opencv
-find_package(OpenCV)
-include_directories(${OpenCV_INCLUDE_DIRS})
+find_package(Threads REQUIRED)
+find_package(CUDAToolkit REQUIRED)
+find_package(OpenCV REQUIRED)
 
-include_directories(${PROJECT_SOURCE_DIR}/)
+if(NOT TARGET TensorRT::TensorRT)
+  include(FindTensorRT.cmake)
+else()
+  message("TensorRT has been found, skipping for ${PROJECT_NAME}")
+endif()
 
-add_executable(csrnet csrnet.cpp)
-target_link_libraries(csrnet nvinfer cudart ${OpenCV_LIBS})
+add_executable(${PROJECT_NAME} ${PROJECT_NAME}.cpp)
+
+target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_CURRENT_LIST_DIR}
+                                                  ${OpenCV_INCLUDE_DIRS})
+
+target_link_libraries(${PROJECT_NAME} PUBLIC Threads::Threads CUDA::cudart
+                                             TensorRT::TensorRT ${OpenCV_LIBS})

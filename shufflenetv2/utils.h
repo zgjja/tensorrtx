@@ -2,6 +2,7 @@
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -63,7 +64,11 @@ static std::map<std::string, nvinfer1::Weights> loadWeights(const std::string& f
         input >> name >> std::dec >> wt.count;
 
         // Load blob
-        auto* val = new uint32_t[wt.count];
+        auto* val = static_cast<uint32_t*>(std::malloc(sizeof(uint32_t) * static_cast<std::size_t>(wt.count)));
+        if (val == nullptr) {
+            std::cerr << "weight allocation failed\n";
+            std::abort();
+        }
         input >> std::hex;
         for (auto x = 0ll; x < wt.count; ++x) {
             input >> val[x];

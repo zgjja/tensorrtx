@@ -2,8 +2,10 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <iostream>
 #include <map>
 #include <opencv2/opencv.hpp>
 #include <vector>
@@ -207,7 +209,10 @@ std::vector<std::vector<float>> doInference(IExecutionContext& context, void* in
         if (i == 0) {
             CHECK(cudaMemcpyAsync(buffers[i], input, size, cudaMemcpyHostToDevice, stream));
         }
-        context.setTensorAddress(tensor_name, buffers[i]);
+        if (!context.setTensorAddress(tensor_name, buffers[i])) {
+            std::cerr << "setTensorAddress failed\n";
+            std::abort();
+        }
 #else
         const int32_t idx = engine.getBindingIndex(NAMES[i]);
         auto s = getSize(engine.getBindingDataType(idx));
@@ -221,9 +226,15 @@ std::vector<std::vector<float>> doInference(IExecutionContext& context, void* in
     }
 
 #if TRT_VERSION >= 8000
-    assert(context.enqueueV3(stream));
+    if (!context.enqueueV3(stream)) {
+        std::cerr << "enqueueV3 failed\n";
+        std::abort();
+    }
 #else
-    assert(context.enqueueV2(buffers.data(), stream, nullptr));
+    if (!context.enqueueV2(buffers.data(), stream, nullptr)) {
+        std::cerr << "enqueueV2 failed\n";
+        std::abort();
+    }
 #endif
 
     std::vector<std::vector<float>> prob;

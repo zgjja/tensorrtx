@@ -1,5 +1,6 @@
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <numeric>
 #include <vector>
@@ -159,11 +160,20 @@ void doInference(IExecutionContext& ctx, void* input, float* output, int64_t bat
         auto dims = ctx.getTensorShape(name);
         auto total = std::accumulate(dims.d, dims.d + dims.nbDims, 1ll, std::multiplies<>());
         std::cout << name << "\t" << total << "\n";
-        ctx.setTensorAddress(name, buffers[i]);
+        if (!ctx.setTensorAddress(name, buffers[i])) {
+            std::cerr << "setTensorAddress failed\n";
+            std::abort();
+        }
     }
-    assert(ctx.enqueueV3(stream));
+    if (!ctx.enqueueV3(stream)) {
+        std::cerr << "enqueueV3 failed\n";
+        std::abort();
+    }
 #else
-    assert(ctx.enqueueV2(buffers.data(), stream, nullptr));
+    if (!ctx.enqueueV2(buffers.data(), stream, nullptr)) {
+        std::cerr << "enqueueV2 failed\n";
+        std::abort();
+    }
 #endif
 
     CHECK(cudaMemcpyAsync(output, buffers[outputIndex], outputSize, cudaMemcpyDeviceToHost, stream));

@@ -1,58 +1,67 @@
 # csrnet
 
+## Overview
+
 The Pytorch implementation is [leeyeehoo/CSRNet-pytorch](https://github.com/leeyeehoo/CSRNet-pytorch).
 
 This repo is a TensorRT implementation of CSRNet.
 
+PartA model download url: https://drive.google.com/file/d/1Z-atzS5Y2pOd-nEWqZRVBDMYJDreGWHH/view
+
 paper : [CSRNet: Dilated Convolutional Neural Networks for Understanding the Highly Congested Scenes](https://arxiv.org/abs/1802.10062)
 
-Dev environment:
-- Ubuntu 22.04
-- TensorRT 8.6
-- OpenCV 4.5.4
-- CMake 3.24
-- GPU Driver 535.113.01
-- CUDA 12.2
-- RTX3080
+## Usage
 
+1. download the pretrained model file and put it at `tensorrtx/models/PartAmodel_best.pth.tar` (skip if you already have it).
 
-# how to run
+2. generate `csrnet.wts` from `PartAmodel_best.pth.tar`
 
 ```bash
-1. generate csrnet engine
-git clone https://github.com/leeyeehoo/CSRNet-pytorch.git
-git clone https://github.com/wang-xinyu/tensorrtx.git
-// copy gen_wts.py to CSRNet-pytorch
-// generate wts file
-python gen_wts.py
-// csrnet wts will be generated in CSRNet-pytorch
-
-2. build csrnet.engine
-// mv CSRNet-pytorch/csrnet.engine to tensorrtx/csrnet
-mv CSRNet-pytorch/csrnet.wts tensorrtx/csrnet
-// build
-mkdir build
-cmake ..
-make
-sudo ./csrnet -s  ./csrnet.wts
-
-Loading weights: ./csrnet.wts
-build engine successfully : ./csrnet.engine
-
-// download images https://github.com/wang-xinyu/tensorrtx/assets/46584679/46bc4def-e573-44ae-996d-5d68927c78ff and copy to images
-sudo ./csrnet -d  ./images
-
-// output e.g
-// enqueueV2 time: 0.0323869s
-// detect time:44ms
-// people num :22.9101 write_path: ../images/data.jpg
+pushd tensorrtx/csrnet
+python3 gen_wts.py
+popd
 ```
 
+3. build C++ code
 
-# result 
+```bash
+pushd tensorrtx/csrnet
+cmake -S . -B build -G Ninja --fresh
+cmake --build build
+popd
+```
 
-inference people num: 22.9101
+4. serialize to `tensorrtx/models/csrnet.engine`
 
-<p align="center">
-<img src= https://raw.githubusercontent.com/wang-xinyu/tensorrtx/dbf857d25f77bf64113fc99a745ccf4973bdd44e/Density_Plot.jpg>
-</p>
+```bash
+pushd tensorrtx/csrnet
+./build/csrnet -s
+popd
+```
+
+5. run inference (reads `tensorrtx/assets/IMG_1.jpg`, writes `tensorrtx/assets/csrnet_output.jpg`)
+
+```bash
+pushd tensorrtx/csrnet
+./build/csrnet -d
+popd
+```
+
+# result
+
+output looks like:
+
+```bash
+...
+Execution time: 62956us
+0.000543074 0.00035309 0.00351256 0.00194812 0.00201269 0.000398191 -0.000205946 -0.000301642 0.000487901 -9.49481e-05
+====
+Execution time: 62431us
+0.000543074 0.00035309 0.00351256 0.00194812 0.00201269 0.000398191 -0.000205946 -0.000301642 0.000487901 -9.49481e-05
+====
+approximate people num: 21
+```
+
+you can also check the output image in `tensorrtx/assets/csrnet_output_tensorrt.jpg`:
+
+![output](../assets/csrnet_output_tensorrt.jpg)

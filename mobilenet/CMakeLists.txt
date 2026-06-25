@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.14)
 
 project(
-  googlenet
+  mobilenet
   VERSION 0.1
   LANGUAGES C CXX CUDA)
 
@@ -33,10 +33,9 @@ if(NOT TARGET TensorRT::TensorRT)
   include(FindTensorRT.cmake)
 endif()
 
-add_executable(${PROJECT_NAME} googlenet.cpp)
+add_executable(${PROJECT_NAME} ${PROJECT_NAME}.cpp)
 
-target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_CURRENT_LIST_DIR}
-                                                  ${OpenCV_INCLUDE_DIRS})
+target_include_directories(${PROJECT_NAME} PRIVATE ${OpenCV_INCLUDE_DIRS})
 
-target_link_libraries(${PROJECT_NAME} PUBLIC Threads::Threads CUDA::cudart
+target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads CUDA::cudart
                                              TensorRT::TensorRT ${OpenCV_LIBS})
